@@ -69,8 +69,9 @@ CREATE INDEX IF NOT EXISTS idx_rules_analysis   ON rules(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_findings_analysis ON findings(analysis_id);
 -- Unique so identical rule sets map to exactly one stored version. The
 -- save_analysis write transaction serializes on this constraint; for a
--- database created before the constraint existed, init_db replaces the old
--- non-unique index with this one in place.
+-- database created before the constraint existed, init_db first collapses
+-- any duplicate-hash versions left by the old racy save and then replaces
+-- the old non-unique index with this one, all in one transaction.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_hash ON analyses(ruleset_hash);
 
 -- Singleton publication pointer: exactly one row (id = 1). It starts at
@@ -151,15 +152,67 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _dedupe_ruleset_hashes(conn: sqlite3.Connection) -> None:
+    """Collapse duplicate ``ruleset_hash`` versions down to the first save.
+
+    Databases written before saves were deduplicated atomically may hold
+    several ``analyses`` rows for one ``ruleset_hash`` (the old racy save).
+    For each duplicated hash the version to keep is chosen deterministically
+    as the earliest ``created_at``, ties broken by the lowest ``id`` — the
+    same "first save wins" rule :func:`save_analysis` applies to duplicate
+    submissions. References in ``active_pointer`` and ``active_history`` that
+    point at a dropped duplicate are rewritten to the kept version (the audit
+    log's revisions, timestamps and row order are untouched), then the
+    dropped versions' ``rules``, ``findings`` and ``analyses`` rows are
+    deleted. Kept versions and their rules/findings are not modified. Runs
+    inside the caller's transaction.
+    """
+    rows = conn.execute(
+        """SELECT ruleset_hash, id FROM analyses
+           WHERE ruleset_hash IN (
+               SELECT ruleset_hash FROM analyses
+               GROUP BY ruleset_hash HAVING COUNT(*) > 1
+           )
+           ORDER BY ruleset_hash, created_at, id"""
+    ).fetchall()
+    keeper_for: dict[str, str] = {}
+    reassign: dict[str, str] = {}  # dropped analysis id -> kept analysis id
+    for row in rows:
+        keeper = keeper_for.get(row["ruleset_hash"])
+        if keeper is None:
+            keeper_for[row["ruleset_hash"]] = row["id"]
+        else:
+            reassign[row["id"]] = keeper
+    for dropped_id, kept_id in reassign.items():
+        conn.execute(
+            "UPDATE active_pointer SET active_id = ? WHERE active_id = ?",
+            (kept_id, dropped_id),
+        )
+        conn.execute(
+            "UPDATE active_history SET active_id = ? WHERE active_id = ?",
+            (kept_id, dropped_id),
+        )
+        conn.execute(
+            "UPDATE active_history SET previous_id = ? WHERE previous_id = ?",
+            (kept_id, dropped_id),
+        )
+        conn.execute("DELETE FROM rules WHERE analysis_id = ?", (dropped_id,))
+        conn.execute("DELETE FROM findings WHERE analysis_id = ?", (dropped_id,))
+        conn.execute("DELETE FROM analyses WHERE id = ?", (dropped_id,))
+
+
 def _ensure_unique_hash_index(conn: sqlite3.Connection) -> None:
     """Upgrade a legacy non-unique ``idx_analyses_hash`` to the unique version.
 
     Databases created before saves were deduplicated atomically carry the
     index as non-unique (``CREATE UNIQUE INDEX IF NOT EXISTS`` is a no-op on
-    the already-existing name). DDL is transactional in SQLite, so dropping
-    and recreating the index inside one transaction leaves the legacy index
-    in place should duplicate hashes (possible only under the old racy save)
-    make the unique creation fail — the existing data is never damaged.
+    the already-existing name) and may hold several ``analyses`` rows for one
+    ``ruleset_hash`` (the old racy save). Any duplicates are collapsed first
+    (see :func:`_dedupe_ruleset_hashes`) and the unique index is then
+    (re)created, all inside one transaction — DDL is transactional in SQLite.
+    Any failure rolls the whole migration back and propagates, so startup
+    fails loudly instead of serving a version list that still contains
+    duplicates with an indeterminate save-reuse target.
     """
     row = conn.execute(
         "SELECT \"unique\" FROM pragma_index_list('analyses') WHERE name = 'idx_analyses_hash'"
@@ -168,10 +221,12 @@ def _ensure_unique_hash_index(conn: sqlite3.Connection) -> None:
         return
     conn.execute("BEGIN")
     try:
+        _dedupe_ruleset_hashes(conn)
         conn.execute("DROP INDEX IF EXISTS idx_analyses_hash")
         conn.execute("CREATE UNIQUE INDEX idx_analyses_hash ON analyses(ruleset_hash)")
-    except sqlite3.IntegrityError:
+    except Exception:
         conn.execute("ROLLBACK")
+        raise
     else:
         conn.execute("COMMIT")
 
