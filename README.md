@@ -36,6 +36,22 @@ docker compose up --build -d
 SQLite 数据文件保存在命名卷 `prefix_data`（容器内 `/data/prefix_policy.db`），容器重启后
 已保存的分析版本不丢失。停止：`docker compose down`（加 `-v` 同时删除数据卷）。
 
+### 旧库升级（启动时自动迁移）
+
+`docker compose up --build -d` 复用已有数据卷启动时，服务在启动阶段（`init_db`）自动
+完成旧库迁移，无需手工干预，且迁移可重复执行：
+
+- **同一 `ruleset_hash` 的重复版本去重**：早期版本在并发保存时可能为同一规则集写入
+  多个分析版本（版本列表出现重复，重复保存时复用哪个版本也不确定）。迁移在**单个事务**
+  内为每个重复的 `ruleset_hash` 按（`created_at`, `id`）选定最早保存的版本保留，把
+  `active_pointer` 与 `active_history` 中指向其余重复版本的引用改为指向保留版本
+  （发布历史的 revision、时间与顺序保持不变），删除其余版本的 rules / findings /
+  analyses 记录，最后建立 `ruleset_hash` 唯一索引。任一步失败都会**整体回滚并让启动
+  报错**（容器无法进入服务状态，日志中给出原因），数据库保持迁移前状态，修复原因后
+  重新启动即可重试；
+- **`rules.priority` INTEGER → TEXT**：旧库的整型优先级列在单个事务内重建为文本列，
+  已有版本数据原样保留（详见下文[“SQLite 表结构”](#sqlite-表结构)）。
+
 ### 不用 Docker，直接本地运行
 
 需要 Python 3.11+：
@@ -1424,6 +1440,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_traffic_audit.py  # 访问观测归因端点测试（LPM 归因、并列裁决、未覆盖、加权汇总、IPv6）
 ├── tests/test_observation_correction.py # 观测纠偏端点测试（翻转/停用、未命中不放行、三级择优、校验、只读）
 ├── tests/test_scoped_ipv6.py     # 带作用域（%zone）IPv6 CIDR 全入口拒绝回归测试
+├── tests/test_duplicate_hash_migration.py # 旧库同一 ruleset_hash 多版本的去重迁移测试（保留最早版本、指针/历史改指、失败整体回滚）
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
@@ -1456,6 +1473,14 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 精确 JSON 整数（不加引号、不丢精度）。服务启动（`init_db`，即 `docker compose up`
 容器启动）时会自动检测旧库的 `rules.priority INTEGER` 并在单个事务内重建该表完成升级，
 已有版本数据原样保留；升级可重复执行。
+
+同样在服务启动时，旧库的 `idx_analyses_hash` 非唯一索引也会自动升级为唯一索引：早期
+版本在并发保存时可能为同一 `ruleset_hash` 写入多个分析版本。迁移在**单个事务**内完成——
+先按（`created_at`, `id`）为每个重复的 `ruleset_hash` 选定最早保存的版本保留，把
+`active_pointer` 与 `active_history` 中指向其余重复版本的引用改为指向保留版本
+（发布历史的 revision、时间与顺序保持不变，保留版本自身的规则与结果原样不动），删除
+其余版本的 rules / findings / analyses 记录，最后重建唯一索引。任一步失败都会整体回滚
+并让启动报错，数据库保持迁移前状态；升级可重复执行。
 
 ### 指纹规则与幂等（ruleset_hash）
 
